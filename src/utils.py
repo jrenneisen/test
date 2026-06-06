@@ -7,10 +7,15 @@ import re
 import logging
 import hashlib
 from pathlib import Path
-from dotenv import load_dotenv
 
 # ─── Load env ─────────────────────────────────────────────────────────────────
-load_dotenv()
+# python-dotenv is only needed locally — on Streamlit Cloud, secrets are
+# injected as real environment variables automatically from the Secrets tab.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # Running on Streamlit Cloud or dotenv not installed — that's fine
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 ROOT_DIR        = Path(__file__).parent.parent
@@ -22,6 +27,7 @@ SAMPLE_PARQUET  = DATA_DIR / "jobs_sample.parquet"
 FAISS_INDEX     = DATA_DIR / "faiss_index.bin"
 EMBEDDINGS_FILE = DATA_DIR / "embeddings.npy"
 JOB_IDS_FILE    = DATA_DIR / "job_ids.npy"
+CLUSTERS_FILE   = DATA_DIR / "job_clusters.npz"   # K-Means job family clusters
 PERSONAS_FILE   = DATA_DIR / "personas.json"
 
 DATA_DIR.mkdir(exist_ok=True)

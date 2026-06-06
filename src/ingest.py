@@ -16,6 +16,10 @@ import numpy as np
 from pathlib import Path
 from datetime import datetime, timedelta
 
+if __package__ is None or __package__ == "":
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from src.utils import (
     DATA_DIR, RAW_CSV, SAMPLE_PARQUET, JSEARCH_API_KEY,
     clean_text, make_job_id, logger
@@ -103,83 +107,206 @@ def _map_kaggle_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ─── JSearch / RapidAPI live ingestion ────────────────────────────────────────
+# ─── JSearch / RapidAPI live ingestion ───────────────────────────────────────
+#
+# API Details:
+#   Host:    jsearch.p.rapidapi.com
+#   Method:  GET /search
+#   Key:     set JSEARCH_API_KEY in .env  (same RapidAPI key used for all services)
+#
+# Equivalent curl:
+#   curl --request GET \
+#        --url 'https://jsearch.p.rapidapi.com/search?query=data+scientist&page=1&num_pages=1' \
+#        --header 'x-rapidapi-host: jsearch.p.rapidapi.com' \
+#        --header 'x-rapidapi-key: YOUR_KEY'
+# ─────────────────────────────────────────────────────────────────────────────
+
+JSEARCH_BASE_URL = "https://jsearch-mega.p.rapidapi.com"
+
+def _jsearch_headers() -> dict:
+    """Return the RapidAPI headers required for every JSearch Mega request."""
+    return {
+        "x-rapidapi-key":  JSEARCH_API_KEY,
+        "x-rapidapi-host": "jsearch-mega.p.rapidapi.com",
+        "Content-Type":    "application/json",
+    }
+
+
+def test_jsearch_connection() -> bool:
+    """
+    Verify the JSearch API key is valid by fetching a single result.
+    Returns True if the connection succeeds, False otherwise.
+    """
+    if not JSEARCH_API_KEY:
+        logger.warning("JSEARCH_API_KEY not configured.")
+        return False
+    try:
+        resp = requests.get(
+            f"{JSEARCH_BASE_URL}/search",
+            headers=_jsearch_headers(),
+            params={"query": "data analyst", "page": "1", "num_pages": "1"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        ok = "data" in data and isinstance(data["data"], list)
+        logger.info(f"JSearch connection {'✅ OK' if ok else '❌ unexpected response'}")
+        return ok
+    except Exception as e:
+        logger.error(f"JSearch connection failed: {e}")
+        return False
+
+
 def fetch_jsearch_jobs(
     query: str = "data scientist",
     num_pages: int = 3,
     country: str = "us",
     date_posted: str = "week",
+    remote_only: bool = False,
 ) -> pd.DataFrame:
     """
-    Fetch live job postings from JSearch API (RapidAPI).
-    Returns a DataFrame in the JobPilot schema.
+    Fetch live job postings from JSearch API (RapidAPI / Google Jobs).
+
+    Args:
+        query:       Search query, e.g. "ML Engineer" or "data analyst remote"
+        num_pages:   Number of result pages to fetch (10 jobs per page)
+        country:     ISO country code, e.g. "us", "gb", "ca"
+        date_posted: Freshness filter — "all" | "today" | "3days" | "week" | "month"
+        remote_only: If True, adds "remote" to the query string
+
+    Returns:
+        DataFrame in JobPilot schema.
     """
     if not JSEARCH_API_KEY:
-        logger.warning("JSEARCH_API_KEY not set. Skipping live ingestion.")
+        logger.warning("JSEARCH_API_KEY not set — skipping live ingestion.")
         return pd.DataFrame()
 
-    url = "https://jsearch.p.rapidapi.com/search"
-    headers = {
-        "X-RapidAPI-Key": JSEARCH_API_KEY,
-        "X-RapidAPI-Host": "jsearch.p.rapidapi.com",
-    }
+    if remote_only:
+        query = f"{query} remote"
 
     records = []
     for page in range(1, num_pages + 1):
         params = {
-            "query": query,
-            "page": str(page),
-            "num_pages": "1",
-            "country": country,
+            "query":       query,
+            "page":        str(page),
+            "num_pages":   "1",
+            "country":     country,
             "date_posted": date_posted,
         }
         try:
-            resp = requests.get(url, headers=headers, params=params, timeout=15)
+            resp = requests.get(
+                f"{JSEARCH_BASE_URL}/search",
+                headers=_jsearch_headers(),
+                params=params,
+                timeout=15,
+            )
             resp.raise_for_status()
             data = resp.json()
+
+            # Handle API error responses
+            if data.get("status") == "ERROR":
+                logger.error(f"JSearch API error: {data.get('error', {}).get('message', 'Unknown')}")
+                break
+
             jobs = data.get("data", [])
-            logger.info(f"JSearch page {page}: {len(jobs)} jobs fetched")
+            logger.info(f"JSearch '{query}' page {page}: {len(jobs)} jobs")
 
             for j in jobs:
+                # Salary — JSearch returns annual or null
+                sal_min = j.get("job_min_salary") or 0
+                sal_max = j.get("job_max_salary") or 0
+
+                # Location string
+                city    = j.get("job_city", "") or ""
+                state   = j.get("job_state", "") or ""
+                country_code = j.get("job_country", "US") or "US"
+                location = ", ".join(filter(None, [city, state, country_code]))
+
                 records.append({
-                    "title":           j.get("job_title", ""),
-                    "company":         j.get("employer_name", ""),
-                    "location":        f"{j.get('job_city', '')}, {j.get('job_country', '')}",
-                    "city":            j.get("job_city", ""),
-                    "country":         j.get("job_country", "US"),
-                    "remote":          j.get("job_is_remote", False),
-                    "description":     j.get("job_description", ""),
-                    "employment_type": j.get("job_employment_type", "FULLTIME"),
-                    "date_posted":     j.get("job_posted_at_datetime_utc", ""),
-                    "url":             j.get("job_apply_link", ""),
-                    "salary_min":      j.get("job_min_salary") or 0,
-                    "salary_max":      j.get("job_max_salary") or 0,
-                    "source":          "jsearch",
+                    "title":            j.get("job_title", ""),
+                    "company":          j.get("employer_name", ""),
+                    "location":         location,
+                    "city":             city,
+                    "country":          country_code,
+                    "remote":           bool(j.get("job_is_remote", False)),
+                    "description":      j.get("job_description", ""),
+                    "employment_type":  _normalize_jsearch_type(
+                                            j.get("job_employment_type", "")
+                                        ),
+                    "date_posted":      j.get("job_posted_at_datetime_utc", ""),
+                    "url":              j.get("job_apply_link", "")
+                                        or j.get("job_google_link", ""),
+                    "salary_min":       float(sal_min),
+                    "salary_max":       float(sal_max),
+                    "source":           "jsearch",
                 })
-            time.sleep(0.5)  # rate limiting
+
+            time.sleep(0.4)   # stay within free-tier rate limits
+
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response else "?"
+            if status == 429:
+                logger.warning("JSearch rate limit hit — waiting 5s...")
+                time.sleep(5)
+                continue
+            logger.error(f"JSearch HTTP {status} on page {page}: {e}")
+            break
         except Exception as e:
             logger.error(f"JSearch page {page} failed: {e}")
             break
 
     if not records:
+        logger.warning("JSearch returned no results.")
         return pd.DataFrame()
 
     df = pd.DataFrame(records)
-    logger.info(f"JSearch: fetched {len(df):,} total live jobs")
+    logger.info(f"JSearch total: {len(df):,} live jobs fetched")
     return df
 
 
-def fetch_multiple_queries(queries: list[str], pages_per_query: int = 2) -> pd.DataFrame:
-    """Fetch jobs for multiple search queries and combine."""
+def _normalize_jsearch_type(et: str) -> str:
+    """Map JSearch employment_type strings to our schema."""
+    mapping = {
+        "FULLTIME":   "Full-time",
+        "PARTTIME":   "Part-time",
+        "CONTRACTOR": "Contract",
+        "INTERN":     "Internship",
+        "TEMPORARY":  "Contract",
+    }
+    return mapping.get((et or "").upper(), "Full-time")
+
+
+def fetch_multiple_queries(
+    queries: list[str],
+    pages_per_query: int = 2,
+    date_posted: str = "week",
+) -> pd.DataFrame:
+    """
+    Fetch jobs for multiple role queries and combine into one DataFrame.
+    Automatically deduplicates by URL before returning.
+    """
     frames = []
     for q in queries:
-        logger.info(f"Fetching: '{q}'")
-        df = fetch_jsearch_jobs(query=q, num_pages=pages_per_query)
+        logger.info(f"JSearch fetching: '{q}'")
+        df = fetch_jsearch_jobs(query=q, num_pages=pages_per_query,
+                                date_posted=date_posted)
         if not df.empty:
             frames.append(df)
-    if frames:
-        return pd.concat(frames, ignore_index=True)
-    return pd.DataFrame()
+        time.sleep(0.3)
+
+    if not frames:
+        return pd.DataFrame()
+
+    combined = pd.concat(frames, ignore_index=True)
+
+    # Remove duplicates by URL (same job listed under multiple queries)
+    if "url" in combined.columns:
+        before = len(combined)
+        combined = combined[combined["url"] != ""]
+        combined = combined.drop_duplicates(subset=["url"])
+        logger.info(f"JSearch dedup by URL: {before} → {len(combined)} records")
+
+    return combined
 
 
 # ─── Synthetic data (fallback) ────────────────────────────────────────────────
